@@ -1,6 +1,10 @@
 # Session End (End of Session)
 
-<!-- Copy this file to docs/memory/handoffs/YYYY-MM-DD/SESSION_END.md (or SESSION_END_<AGENT>.md if multiple agents work on the same day) when finishing work. -->
+<!--
+  Filename convention: SESSION_END_<AGENT>.md (e.g., SESSION_END_CLAUDE.md)
+  Location: docs/memory/handoffs/YYYY-MM-DD/
+  For multiple sessions in one day, append a sequence number: SESSION_END_CLAUDE_2.md
+-->
 
 Snapshot Date: YYYY-MM-DD
 Primary Commit: `(commit hash or "N/A")`
@@ -57,3 +61,4 @@ Exact commands or actions for the next developer to continue:
 - Branch: `(branch name)`
 - Status: Clean commit / Local commit pending push / Uncommitted WIP
 - Uncommitted files: (list if any, or "none")
+- ACTIVE_SESSIONS.md updated: (yes/no - mark your session COMPLETED or remove your row)
