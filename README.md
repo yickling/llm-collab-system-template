@@ -79,4 +79,4 @@ Any LLM or human that can read and write files can participate.
 
 ## License
 
-Use freely. No attribution required. Adapt to your project's needs.
+MIT License. See [LICENSE](LICENSE) for details.
