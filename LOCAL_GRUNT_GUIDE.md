@@ -25,36 +25,69 @@ The brains makes one API call to decompose the work. The grunts run locally for 
 
 ## How It Works
 
+There are two dispatch modes. Choose based on whether your brains LLM has shell access.
+
+### Direct Dispatch (Fully Autonomous -- Recommended)
+
+If the brains LLM has shell access (Claude Code, Codex, Cursor), it handles everything in a closed loop. No human intervention needed.
+
 ```
-You (or your CI pipeline) identify a change needed
+You give the brains a high-level instruction
+  e.g., "Rename getUser to fetchUser across the codebase"
         │
         ▼
-Brains LLM (API-hosted, strong reasoning)
+Brains LLM (Claude Code / Codex / Cursor)
   1. Reads the relevant source files
   2. Understands what needs to change
-  3. Decomposes the change into atomic grunt tasks
-  4. Generates task definitions in structured markdown
+  3. Generates a grunt task definition
+  4. Calls: ./scripts/dispatch-grunt.sh --inline "<task>"
+  5. Reads the structured result
+  6. If DONE → verifies, generates next task
+     If BLOCKED → regenerates with fresh file contents
+     If FAILED → investigates and adjusts
+  7. Repeats until all changes are applied
+  8. Commits when done
+        │
+        │  curl → localhost:11434
+        ▼
+Grunt LLM (Ollama / LM Studio / llama.cpp)
+  - Receives system prompt + one task
+  - Executes mechanically
+  - Returns DONE / BLOCKED / FAILED
+```
+
+**What you need for direct dispatch:**
+1. Local LLM server running (`ollama serve`)
+2. Brains LLM with shell access
+3. `jq` installed
+4. `scripts/dispatch-grunt.sh` executable
+
+### Indirect Dispatch (Human or Script in the Middle)
+
+If the brains doesn't have shell access, it outputs task definitions for you to dispatch.
+
+```
+You identify a change needed
         │
         ▼
-Task Runner (script or manual dispatch)
-  1. Reads task definitions
-  2. Resolves dependency ordering (depends_on fields)
-  3. Feeds each task to a grunt LLM one at a time
-  4. Collects results
+Brains LLM (API-hosted, any provider)
+  1. Reads the relevant source files
+  2. Decomposes into atomic grunt tasks
+  3. Outputs task definitions as structured markdown
+        │
+        ▼
+You / Runner Script
+  1. Run: ./scripts/dispatch-grunt.sh task-001.md
+  2. Run: ./scripts/dispatch-grunt.sh task-002.md
+  3. Collect results
         │
         ▼
 Grunt LLM (locally-hosted, small model)
-  1. Receives system prompt + one task definition
-  2. Checks preconditions
-  3. Executes the operation mechanically
-  4. Runs validation checks
-  5. Reports DONE / BLOCKED / FAILED
+  - Executes each task mechanically
+  - Returns DONE / BLOCKED / FAILED
         │
         ▼
-Results flow back to Brains (or to you)
-  - DONE: change was applied successfully
-  - BLOCKED: task definition was wrong (regenerate)
-  - FAILED: operation had unexpected result (investigate)
+Results flow back to you (or to the brains for review)
 ```
 
 ## What You Need
@@ -138,56 +171,78 @@ cd llama.cpp && make
 
 ## Dispatching Tasks
 
-### Manual Dispatch (Simple)
+This project includes `scripts/dispatch-grunt.sh`, a dispatch script that handles the API calls for you. It supports Ollama (default) and any OpenAI-compatible API (LM Studio, llama.cpp, vLLM).
 
-For occasional use, you can dispatch tasks manually:
-
-1. Have your brains LLM generate task definitions (paste the `TASK_FORMAT.md` and relevant `task-types/` docs into its context).
-2. Copy the system prompt from `GRUNT_SYSTEM_PROMPT.md`.
-3. Send the system prompt + task definition to your local LLM.
-4. Read the grunt's structured result.
-5. Apply the change if DONE, or investigate if BLOCKED/FAILED.
-
-### Script-Based Dispatch (Recommended)
-
-Write a simple script that:
-
-1. Reads task definitions from a directory or stdin
-2. Resolves `depends_on` ordering
-3. Sends each task to the local LLM API
-4. Collects and stores results
-5. Reports summary to the brains or to you
-
-Example using Ollama's API:
+### Using the Dispatch Script
 
 ```bash
-#!/bin/bash
-# dispatch-grunt-task.sh
-# Usage: ./dispatch-grunt-task.sh task-definition.md
+# From a file
+./scripts/dispatch-grunt.sh path/to/task.md
 
-SYSTEM_PROMPT=$(cat local-grunt/GRUNT_SYSTEM_PROMPT.md | sed -n '/## BEGIN SYSTEM PROMPT/,/## END SYSTEM PROMPT/p')
-TASK=$(cat "$1")
+# From stdin (pipe)
+cat task.md | ./scripts/dispatch-grunt.sh -
 
-curl -s http://localhost:11434/api/chat -d "{
-  \"model\": \"qwen2.5-coder:7b-instruct\",
-  \"messages\": [
-    {\"role\": \"system\", \"content\": $(echo "$SYSTEM_PROMPT" | jq -Rs .)},
-    {\"role\": \"user\", \"content\": $(echo "$TASK" | jq -Rs .)}
-  ],
-  \"stream\": false
-}" | jq -r '.message.content'
+# Inline (useful for brains LLMs calling from shell)
+./scripts/dispatch-grunt.sh --inline "# GRUNT TASK ..."
 ```
 
-### Brains LLM Integration
+**Configure via environment variables:**
 
-If your brains LLM has tool/function calling or shell access, it can dispatch grunt tasks directly:
+```bash
+# Use a different model
+GRUNT_MODEL=llama3.1:8b ./scripts/dispatch-grunt.sh task.md
 
-1. Brains generates the task definition
-2. Brains calls the local LLM API with the system prompt + task
-3. Brains reads the structured result
-4. Brains decides next steps based on the result
+# Use LM Studio (OpenAI-compatible API)
+GRUNT_PROVIDER=openai-compat GRUNT_API_URL=http://localhost:1234/v1 \
+  ./scripts/dispatch-grunt.sh task.md
 
-See [local-grunt/README.md](local-grunt/README.md) for detailed brains integration patterns.
+# Use llama.cpp server
+GRUNT_PROVIDER=openai-compat GRUNT_API_URL=http://localhost:8080/v1 \
+  ./scripts/dispatch-grunt.sh task.md
+```
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GRUNT_MODEL` | `qwen2.5-coder:7b-instruct` | Model name |
+| `GRUNT_API_URL` | `http://localhost:11434` | API endpoint |
+| `GRUNT_PROVIDER` | `ollama` | `ollama` or `openai-compat` |
+| `GRUNT_TIMEOUT` | `120` | Request timeout (seconds) |
+| `GRUNT_PROMPT_PATH` | Auto-detected | Path to GRUNT_SYSTEM_PROMPT.md |
+
+### Manual Dispatch (Without the Script)
+
+For one-off tasks you can also dispatch manually via your LLM's chat interface:
+
+1. Copy the system prompt from `GRUNT_SYSTEM_PROMPT.md` (between the BEGIN/END markers).
+2. Paste it as the system message in your local LLM interface (Ollama CLI, LM Studio chat, etc.).
+3. Paste the task definition as the user message.
+4. Read the structured result.
+
+### Direct Dispatch from Brains LLM
+
+If your brains LLM has shell access (Claude Code, Codex, Cursor), it can call `dispatch-grunt.sh` directly and read the result -- creating a fully autonomous loop.
+
+**Example -- Claude Code dispatching and reading a result:**
+
+```bash
+# The brains generates a task and dispatches it
+RESULT=$(./scripts/dispatch-grunt.sh --inline '# GRUNT TASK
+## METADATA
+- task_id: GT-2026-02-27-001
+- task_type: EDIT
+...
+')
+
+# The brains reads the result and checks status
+echo "$RESULT"
+# If status: DONE → proceed to next task
+# If status: BLOCKED → regenerate task with fresh file contents
+# If status: FAILED → investigate error_output
+```
+
+The brains repeats this loop for each task in the batch. No human involvement needed.
+
+See [local-grunt/README.md](local-grunt/README.md#brains-integration-patterns) for agent-specific configuration (Claude Code, Codex, Cursor) and copy-paste config blocks.
 
 ## Cost Optimization Strategies
 

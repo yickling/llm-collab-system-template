@@ -4,6 +4,10 @@ A task execution protocol for small, locally-hosted LLMs (7b-20b parameters). A 
 
 ## Architecture
 
+The brains LLM can dispatch tasks to grunts either **indirectly** (generating definitions for a human/script to dispatch) or **directly** (calling the local LLM API itself via shell access).
+
+### Indirect Dispatch (human or runner in the middle)
+
 ```
 ┌─────────────────────────────────────┐
 │            BRAINS LLM               │
@@ -17,6 +21,13 @@ A task execution protocol for small, locally-hosted LLMs (7b-20b parameters). A 
                │ Task Definitions (structured markdown)
                ▼
 ┌─────────────────────────────────────┐
+│   Human / Runner Script             │
+│   - Dispatches tasks to grunt       │
+│   - Collects results                │
+└──────────────┬──────────────────────┘
+               │
+               ▼
+┌─────────────────────────────────────┐
 │          GRUNT LLM(s)              │
 │   (Llama 7B, Mistral 7B, etc.)    │
 │   - Reads one task at a time        │
@@ -26,6 +37,33 @@ A task execution protocol for small, locally-hosted LLMs (7b-20b parameters). A 
 │   - STOPs on any ambiguity          │
 └─────────────────────────────────────┘
 ```
+
+### Direct Dispatch (brains calls grunt API via shell)
+
+```
+┌─────────────────────────────────────┐
+│            BRAINS LLM               │
+│   (Claude Code, Codex, Cursor)     │
+│   - Reads codebase                  │
+│   - Plans changes                   │
+│   - Generates grunt task            │
+│   - Calls dispatch-grunt.sh ◄────── shell access required
+│   - Reads structured result         │
+│   - Decides next steps              │
+│   - Commits when all DONE           │
+└──────────────┬──────────────────────┘
+               │ curl → localhost:11434
+               ▼
+┌─────────────────────────────────────┐
+│          GRUNT LLM                  │
+│   (Ollama / LM Studio / vLLM)     │
+│   - Receives system prompt + task   │
+│   - Executes mechanically           │
+│   - Returns structured result       │
+└─────────────────────────────────────┘
+```
+
+**Direct dispatch requires**: The brains LLM must have shell/command execution access, and a local LLM server must be running on the same machine (or reachable via network). See [QUICKSTART.md](QUICKSTART.md) for setup.
 
 ## When to Use Grunts
 
@@ -76,6 +114,7 @@ Grunts do **not** participate in `docs/memory/` handoffs. The brains LLM that di
 | `examples/rename-and-update-imports.md` | Multi-task: rename file + update imports |
 | `examples/create-config-file.md` | Multi-task: create config + validate |
 | `examples/search-and-replace-pattern.md` | Multi-task: find pattern, bulk replace |
+| `../scripts/dispatch-grunt.sh` | Dispatch script (Ollama + OpenAI-compatible APIs) |
 
 ## Workflow
 
@@ -94,62 +133,176 @@ For the full human developer guide (cost analysis, optimization strategies, trou
 
 ## Brains Integration Patterns
 
-Any LLM acting as a "brains" can generate grunt tasks. Here is how to enable each agent:
+Any LLM acting as a "brains" can generate grunt tasks. There are two modes:
 
-### Claude Code
+| Mode | How it works | Requires |
+|------|-------------|----------|
+| **Indirect** | Brains outputs task definitions; human or script dispatches them | Nothing special |
+| **Direct** | Brains calls `dispatch-grunt.sh` via shell and reads the result | Shell access + local LLM server running |
+
+Direct dispatch is the fully autonomous mode -- the brains generates a task, dispatches it, reads the result, and acts on it in a closed loop. No human intervention needed.
+
+### Preconditions for Direct Dispatch
+
+1. **Local LLM server running** -- Ollama, LM Studio, llama.cpp, or vLLM serving a model on localhost.
+2. **Brains has shell access** -- Claude Code (`Bash` tool), Codex (sandbox shell), Cursor (terminal).
+3. **`jq` installed** -- The dispatch script uses `jq` for JSON handling (`brew install jq` or `apt install jq`).
+4. **`scripts/dispatch-grunt.sh` exists** -- The dispatch script in this repo.
+
+Test that the preconditions are met:
+
+```bash
+# Check Ollama is running
+curl -s http://localhost:11434/api/tags | jq '.models[].name'
+
+# Check dispatch script is executable
+./scripts/dispatch-grunt.sh --help
+
+# Test with a trivial task
+echo '# GRUNT TASK
+## METADATA
+- task_id: GT-TEST-001
+- task_type: RUN
+- created_by: test
+- created_at: 2026-01-01T00:00:00Z
+- depends_on: none
+## TARGET
+- file: N/A
+- working_directory: /tmp
+## PRECONDITIONS
+- [ ] Directory `/tmp` exists
+## OPERATION
+- action: RUN
+- command: echo "grunt works"
+- shell: /bin/bash
+- timeout_seconds: 10
+- capture: stdout
+- expected_exit_code: 0
+## VALIDATION
+- not_applicable
+## ROLLBACK
+- On failure: STOP_AND_REPORT' | ./scripts/dispatch-grunt.sh -
+```
+
+### Claude Code (Direct Dispatch)
 
 Add to `CLAUDE.md`:
 
 ```markdown
 ## Local Grunt Protocol
 
-This project supports offloading mechanical tasks to locally-hosted small LLMs.
+This project supports offloading mechanical tasks to a locally-hosted small LLM.
 Read `local-grunt/README.md` for the architecture.
 
+### When to use grunts
 When you identify purely mechanical work (exact string replacements, file creation
-from specified content, running commands), generate grunt task definitions following
-`local-grunt/TASK_FORMAT.md` and the relevant `local-grunt/task-types/` spec.
+from specified content, running commands), dispatch it to the local grunt LLM
+instead of performing it yourself. This saves API costs.
 
-Follow `local-grunt/CONSTRAINTS.md` when decomposing work into tasks.
-See `local-grunt/examples/` for complete worked examples.
+### How to dispatch directly
+1. Generate a task definition following `local-grunt/TASK_FORMAT.md` and the
+   relevant `local-grunt/task-types/` spec.
+2. Write the task to a temp file or pass it inline to the dispatch script.
+3. Call: `./scripts/dispatch-grunt.sh --inline "<task definition>"`
+   Or:   `./scripts/dispatch-grunt.sh /path/to/task.md`
+4. Read the structured result (DONE / BLOCKED / FAILED).
+5. If DONE, verify the change. If BLOCKED/FAILED, investigate and retry.
 
-Output task definitions so the human (or a runner script) can dispatch them
-to the local grunt LLM. Do NOT execute grunt tasks yourself -- generate the
-definitions and let the grunt handle execution.
+### Constraints
+Follow `local-grunt/CONSTRAINTS.md` when decomposing work.
+See `local-grunt/examples/` for complete multi-task decomposition examples.
+
+### Environment
+- Grunt server: Ollama on localhost:11434
+- Model: qwen2.5-coder:7b-instruct
+- Dispatch script: ./scripts/dispatch-grunt.sh
 ```
 
-### OpenAI Codex
+**Example -- Claude Code dispatching a grunt task directly:**
+
+```bash
+# Claude Code generates a task and dispatches it in one step
+./scripts/dispatch-grunt.sh --inline '# GRUNT TASK
+
+## METADATA
+- task_id: GT-2026-02-27-001
+- task_type: EDIT
+- created_by: Claude
+- created_at: 2026-02-27T10:00:00Z
+- depends_on: none
+- priority: 100
+- batch_id: GB-2026-02-27-001
+
+## TARGET
+- file: /Users/dev/project/src/config.ts
+- working_directory: N/A
+
+## PRECONDITIONS
+- [ ] File `/Users/dev/project/src/config.ts` exists
+- [ ] File `/Users/dev/project/src/config.ts` contains the exact string: `"version": "1.2.3"`
+
+## OPERATION
+- action: EDIT
+- find_exact: |
+    ```typescript
+      version: "1.2.3",
+    ```
+- replace_with: |
+    ```typescript
+      version: "1.3.0",
+    ```
+- occurrence: FIRST
+- expected_match_count: 1
+
+## VALIDATION
+- [ ] File `/Users/dev/project/src/config.ts` contains the exact string: `version: "1.3.0"`
+
+## ROLLBACK
+- On failure: STOP_AND_REPORT'
+```
+
+Claude Code reads the result, checks for `status: DONE`, and proceeds.
+
+### OpenAI Codex (Direct Dispatch)
 
 Add to `AGENTS.md`:
 
 ```markdown
-## Grunt Task Generation
+## Grunt Task Dispatch
 
-When work is purely mechanical, generate grunt task definitions instead of
-performing the changes directly. Follow the format in local-grunt/TASK_FORMAT.md
-and the operation specs in local-grunt/task-types/.
+When work is purely mechanical, dispatch it to the local grunt LLM.
+
+To dispatch:
+  ./scripts/dispatch-grunt.sh /path/to/task.md
+  # or inline:
+  ./scripts/dispatch-grunt.sh --inline "<task markdown>"
+
+Follow the format in local-grunt/TASK_FORMAT.md and local-grunt/task-types/.
 
 Rules (from local-grunt/CONSTRAINTS.md):
 - One operation per task
 - All context inline (absolute paths, exact strings)
 - Include validation steps for every modifying task
 - Maximum 4000 tokens per task definition
+
+Read the result. If status is DONE, verify the change.
+If BLOCKED or FAILED, investigate and regenerate.
 ```
 
-### Cursor / Antigravity
+### Cursor / Antigravity (Direct Dispatch)
 
 Add to `.cursorrules`:
 
 ```markdown
 This project has a local grunt protocol in local-grunt/.
-For mechanical tasks (string replacements, file creation, command execution),
-generate structured grunt task definitions following local-grunt/TASK_FORMAT.md
-instead of performing the changes. The human will dispatch them to a local LLM.
+For mechanical tasks, dispatch them to the local grunt LLM by running:
+  ./scripts/dispatch-grunt.sh --inline "<task definition>"
+Follow local-grunt/TASK_FORMAT.md for format. Read the result for status.
 ```
 
-### Any LLM Agent (Generic)
+### Indirect Mode (Any Agent Without Shell Access)
 
-Include in your system prompt:
+If the brains LLM does not have shell access, it outputs task definitions for a human or runner script to dispatch. Include in your system prompt:
 
 ```
 You can generate task definitions for a local grunt LLM to execute mechanical work.
